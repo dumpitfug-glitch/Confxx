@@ -38,3 +38,5 @@ vless://f9bab397-0093-4523-af17-8051c155559c@warehousecloud.mooo.com:443?path=%2
 vless://f9bab397-0093-4523-af17-8051c155559c@warehousecloud.mooo.com:443?mode=packet-up&path=%2FONPn8dJLI6&security=tls&encryption=none&extra=%7Bmode%3Dpacket-up%2C%20xPaddingBytes%3D100-1000%7D&host=warehousecloud.mooo.com&type=xhttp&sni=warehousecloud.mooo.com#%F0%9F%87%A9%F0%9F%87%AA%20xhttp
 trojan://yooog56ts3ymtpp5@warehousecloud.mooo.com:443?mode=gun&security=tls&authority=warehousecloud.mooo.com&type=grpc&serviceName=%2F42279%2FjjSkwuuvYm&sni=warehousecloud.mooo.com#%F0%9F%87%A9%F0%9F%87%AA%20trojan-grpc
 hysteria2://ojv6xogoomun7a0b@warehousecloud.mooo.com:443?security=tls&obfs=salamander&alpn=h3&obfs-password=vtjbff2kburoz8qq&insecure=0&sni=warehousecloud.mooo.com#%F0%9F%87%A9%F0%9F%87%AA%20Hysteria
+vless://806ee4aac03542899b70c754f0a5af5b@81.19.141.248:32915?type=tcp&security=none#connection3
+vless://320824e385fa4d3e92dd35e025481084@138.124.126.241:44464?type=tcp&security=none#dod
