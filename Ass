@@ -42,3 +42,4 @@ vless://806ee4aac03542899b70c754f0a5af5b@81.19.141.248:32915?type=tcp&security=n
 vless://320824e385fa4d3e92dd35e025481084@138.124.126.241:44464?type=tcp&security=none#dod
 vless://cfaaf48a-1716-4d97-a5fd-d7b25c8d2c05@217.179.50.94:443?security=reality&encryption=none&pbk=-ZN1nQ0XrRIGBLAA9qx0X2gh8dPZCwS-hUYBVK2IQ3M&headerType=&fp=chrome&spx=%2FaSBOMxP3s1LWWRQ&type=tcp&sni=www.twitch.tv&sid=b702eb#grom-poland%20%F0%9F%87%B5%F0%9F%87%B1
 vless://b18d5990-96eb-4587-a386-7f8ef7591e6a@pl-waw.dontblockmepls.com:2063/?type=tcp&security=reality&flow=xtls-rprx-vision&sni=rusbid.de&pbk=MMpt_jWc4J3oySBdf5sPDVRkiWlZmOObth6A1scM9BM&fp=chrome&alpn=h2,http/1.1#Warsaw%2C%20Poland_REALITY
+vless://e620901e-ffef-4f45-9b2a-a9c847e9f719@2.27.86.19:38106?encryption=none&security=none&type=tcp#germany-TV
