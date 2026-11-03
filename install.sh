@@ -2,6 +2,30 @@
 # =====================================================================
 #  VLESS-стек за собственным сайтом (Debian / Ubuntu)
 #
+#  ------------------------------ НАСТРОЙКИ ------------------------------
+#
+#  SNI для Reality: это поле sni= в основной ссылке и serverNames на сервере.
+#    Пусто (рекомендуется) = подставится DOMAIN — тот самый домен, по которому
+#    вы подключаетесь к серверу и который уже стоит адресом в профиле клиента.
+#    Скорее всего нужен именно он: в режиме "self-steal" Reality берёт за образец
+#    собственный nginx, а у него сертификат выдан на DOMAIN, так что снаружи SNI
+#    совпадает с настоящим сертификатом сайта.
+#    Свой SNI имеет смысл задавать, только если вы точно понимаете зачем: сертификат
+#    nginx всё равно выдан на DOMAIN, и при проверке с чужим SNI он не совпадёт.
+#    Пример:  SNI="example.com"
+SNI="${SNI:-}"
+#
+#  UDP-порт WireGuard на выходных релеях (режим chain). На релее он открыт
+#  только для IP входного сервера.
+WG_PORT="${WG_PORT:-51820}"
+#
+#  Внутренняя сеть туннелей (два первых октета), режим chain. Релей №k:
+#  вход = WG_NET.k.1, релей = WG_NET.k.2. Менять нужно, только если 10.77.x.x
+#  уже занято у вашего хостера.
+WG_NET="${WG_NET:-10.77}"
+#
+#  ----------------------------------------------------------------------
+#
 #  РЕЖИМ 1 — warp: всё на одном сервере, выход через Cloudflare WARP
 #
 #    443/tcp -> Xray (VLESS + Reality + Vision, "self-steal": dest = свой nginx)
@@ -18,25 +42,31 @@
 #  РЕЖИМ 2 — chain: входной сервер + от 1 до 3 выходных релеев
 #
 #    клиент -> ВХОД (сайт-заглушка + Xray, всё как в режиме 1)
-#                 |-- TCP -> HAProxy 127.0.0.1:10443 (выбор релея по нагрузке)
-#                 |-- UDP -> Xray напрямую, на случайный релей (HAProxy UDP не умеет)
-#                 '--> ВЫХОДНОЙ РЕЛЕЙ (Shadowsocks-2022, TCP+UDP) -> интернет
+#                 |  Xray выбирает релей для каждого соединения (случайно среди
+#                 |  живых; упавший исключается пробой каждые 15 с)
+#                 |-- WireGuard (ядро Linux, ничего поверх) --> РЕЛЕЙ 1 -> интернет
+#                 |-- WireGuard                             --> РЕЛЕЙ 2 -> интернет
+#                 '-- WireGuard                             --> РЕЛЕЙ 3 -> интернет
 #
 #    * Домен и сайт нужны ТОЛЬКО входному серверу (клиент заходит на него по VLESS
 #      с SNI этого домена, снаружи это выглядит как обычный HTTPS-сайт).
 #    * Релеи указываются ТОЛЬКО по IP: домены им не нужны, сайты на них не создаются,
 #      сертификаты не выпускаются. Скрипт настраивает их САМ по SSH по этому IP
 #      (чистый Debian/Ubuntu с root-доступом).
-#    * Между своими серверами НЕТ VLESS/Reality/TLS: канал вход -> релей это
-#      Shadowsocks-2022 (AEAD, предварительно общий ключ, защита от повторов) —
-#      лёгкий протокол без рукопожатий, быстрый и безопасный. Маскировка здесь не
-#      нужна: провайдер всё равно видит, что это шифрованный канал между вашими
-#      серверами. Порт релея открыт ТОЛЬКО для IP входного сервера.
+#    * Канал вход -> релей — это обычный WireGuard в ядре Linux: никаких SOCKS,
+#      Shadowsocks, VLESS, TLS, HAProxy и прочих надстроек. Пакеты идут ядро -> ядро
+#      (ChaCha20-Poly1305, один UDP-порт), без пользовательского режима, а
+#      PersistentKeepalive держит туннель "тёплым", чтобы первый пакет после простоя
+#      не ждал рукопожатия. Порт релея открыт ТОЛЬКО для IP входного сервера.
+#    * На входе у каждого релея свой интерфейс wgx1..wgx3 со своим адресом; Xray
+#      привязывает исходящие соединения к адресу нужного туннеля (sendThrough), а
+#      policy routing (ip rule from <адрес>) отправляет их в этот туннель.
+#    * Релей = только ядро: wg + NAT (MASQUERADE) + ip_forward. Ни Xray, ни агентов,
+#      ни открытых портов, кроме UDP WireGuard для входного сервера.
+#      Весь трафик (TCP, UDP, QUIC, звонки, игры) идёт одним и тем же путём.
+#    * DNS-имена клиентов резолвит входной сервер, но запросы идут через туннель
+#      (сам вход прямого DNS наружу не делает).
 #    * На выходе нет WARP: трафик уходит в интернет напрямую, с IP релея.
-#    * На каждом релее крутится крошечный агент: он измеряет CPU / load / сеть / RAM
-#      и отдаёт входному серверу "вес" в процентах. HAProxy раздаёт новые соединения
-#      пропорционально свободным ресурсам (balance leastconn + динамические веса),
-#      упавший релей исключается автоматически.
 #    * Прямого выхода с входного сервера нет (fail-closed).
 #
 #  Запуск (скрипт должен лежать файлом — он сам копирует себя на выходные релеи):
@@ -47,17 +77,15 @@
 #      EXITS="203.0.113.10 203.0.113.11:2222 ubuntu@203.0.113.12" \
 #      bash install.sh                                 # режим chain
 #
-#  Переменные (необязательные):
+#  Переменные (необязательные; SNI, WG_PORT и WG_NET — см. НАСТРОЙКИ выше):
 #    EMAIL=…           e-mail для Let's Encrypt (входной сервер)
 #    FORCE=1           не проверять DNS
 #    NO_UFW=1          не трогать фаервол
 #    EXIT_SSH_PASS=…   пароль SSH выходных релеев (иначе спросит при копировании ключа)
 #    ENTRY_IP=…        IP входного сервера, как его видят релеи (по умолчанию — внешний IP)
-#    SS_METHOD=…       шифр канала вход -> релей (по умолчанию 2022-blake3-aes-128-gcm;
-#                      без AES-NI / на ARM быстрее 2022-blake3-chacha20-poly1305;
-#                      ещё доступен 2022-blake3-aes-256-gcm)
-#    AGENT_PORT=9777   порт агента нагрузки на релеях (открыт только для входного сервера)
-#    NET_CAP_MBIT=1000 полоса канала релея, Мбит/с (для расчёта загрузки сети)
+#
+#  Нужно ядро с WireGuard (Linux 5.6+, либо Ubuntu 20.04+ / Debian 11+ на KVM/VDS;
+#  в контейнерах OpenVZ/LXC WireGuard обычно недоступен).
 #
 #  MODE=exit — служебный режим, его запускает входной сервер на релеях.
 # =====================================================================
@@ -71,20 +99,16 @@ NO_UFW="${NO_UFW:-}"          # NO_UFW=1 — не трогать фаервол
 EXITS="${EXITS:-}"            # chain: список выходных релеев (1–3), по IP
 EXIT_SSH_PASS="${EXIT_SSH_PASS:-}"
 ENTRY_IP="${ENTRY_IP:-}"
-SS_METHOD="${SS_METHOD:-}"    # шифр канала вход -> релей (Shadowsocks-2022)
-SS_METHOD_ARG="$SS_METHOD"    # то, что задал пользователь (важнее сохранённого значения)
-AGENT_PORT="${AGENT_PORT:-9777}"
-NET_CAP_MBIT="${NET_CAP_MBIT:-1000}"
 PARAMS_FILE="${PARAMS_FILE:-}"
 
 XCONF=/usr/local/etc/xray/config.json
 ENVF=/root/.vpn-secrets.env          # секреты входного сервера (warp / chain)
 EXIT_ENVF=/root/.vpn-exit.env        # параметры выходного релея
+EXIT_PUB=/root/.vpn-exit.pub         # публичный ключ WireGuard релея (его забирает вход)
 WEBROOT=/var/www/hlebcraft
 WARPDIR=/etc/warp
-HA_CFG=/etc/haproxy/haproxy.cfg
-HA_PORT=10443
-HA_SOCK=/run/haproxy-vpn.sock
+WG_DIR=/etc/wireguard
+HA_CFG=/etc/haproxy/haproxy.cfg      # только для уборки HAProxy от прежней версии
 EXITS_MAP=/etc/vpn-exits.map
 CHAIN_KEY=/root/.ssh/vpn_chain_ed25519
 CHAIN_KNOWN=/root/.ssh/known_hosts_vpnchain
@@ -92,8 +116,9 @@ SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
 
 SNIFF='"sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}'
 RE_DOMAIN='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z0-9-]+$'
+SERVER_NAMES=""                      # заполняет resolve_sni
 
-EX_USER=(); EX_HOST=(); EX_PORT=(); EX_IP=()
+EX_USER=(); EX_HOST=(); EX_PORT=(); EX_IP=(); EX_PUB=()
 SSH_O=(-o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$CHAIN_KNOWN" -o ConnectTimeout=15)
 
 log(){ printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
@@ -103,20 +128,20 @@ trap 'die "Сбой на строке $LINENO"' ERR
 
 is_tty(){ [[ -t 0 ]]; }
 valid_domain(){ [[ "$1" =~ $RE_DOMAIN && ! "$1" =~ ^[0-9.]+$ ]]; }
-# длина ключа (байт) для шифра Shadowsocks-2022; код 1, если шифр неизвестен
-ss_keylen(){
-  case "$1" in
-    2022-blake3-aes-128-gcm) echo 16 ;;
-    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) echo 32 ;;
-    *) return 1 ;;
-  esac
-}
 
-# значение из прежнего ENVF, не засоряя окружение
-saved(){
-  [[ -f "$ENVF" ]] || return 0
-  ( set +eu; trap - ERR; . "$ENVF" >/dev/null 2>&1 || true; eval "printf '%s' \"\${$1:-}\"" )
+# имя интерфейса, адреса и таблица маршрутизации для релея с индексом $1 (0..2)
+wg_if(){ printf 'wgx%d' $(( $1 + 1 )); }
+wg_entry_ip(){ printf '%s.%d.1' "$WG_NET" $(( $1 + 1 )); }
+wg_exit_ip(){ printf '%s.%d.2' "$WG_NET" $(( $1 + 1 )); }
+wg_table(){ printf '%d' $(( 101 + $1 )); }
+
+# значение переменной из env-файла, не засоряя окружение
+env_get(){
+  local f="$1" k="$2"
+  [[ -f "$f" ]] || return 0
+  ( set +eu; trap - ERR; . "$f" >/dev/null 2>&1 || true; eval "printf '%s' \"\${$k:-}\"" )
 }
+saved(){ env_get "$ENVF" "$1"; }
 save_kv(){
   local k="$1" v="$2"
   touch "$ENVF"; chmod 600 "$ENVF"
@@ -147,6 +172,28 @@ preflight(){
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
 }
 
+# настройки WireGuard (режимы chain и exit)
+check_wg_settings(){
+  local a b
+  if ! [[ "$WG_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$WG_PORT < 1 || 10#$WG_PORT > 65535 )); then
+    die "Некорректный WG_PORT=\"$WG_PORT\" (нужен порт 1–65535)"
+  fi
+  [[ "$WG_NET" =~ ^([0-9]{1,3})\.([0-9]{1,3})$ ]] || die "Некорректный WG_NET=\"$WG_NET\" (ожидается вид 10.77)"
+  a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+  (( a <= 255 && b <= 255 )) || die "Некорректный WG_NET=\"$WG_NET\""
+}
+
+# WireGuard должен быть в ядре (в OpenVZ/LXC и на очень старых ядрах его нет)
+check_wireguard(){
+  command -v wg >/dev/null || die "Не установлен wireguard-tools"
+  if ! ip link add vpnwgtest type wireguard 2>/dev/null; then
+    modprobe wireguard 2>/dev/null || true
+    ip link add vpnwgtest type wireguard 2>/dev/null \
+      || die "Ядро этого сервера не поддерживает WireGuard (контейнер OpenVZ/LXC или ядро старше 5.6; на Debian 10 нужен backports). Возьмите KVM/VDS с Debian 11+ / Ubuntu 20.04+."
+  fi
+  ip link del vpnwgtest 2>/dev/null || true
+}
+
 select_mode(){
   case "${MODE,,}" in
     warp|1)  MODE=warp;  return 0 ;;
@@ -165,8 +212,8 @@ select_mode(){
   1) WARP    — один сервер: сайт + VLESS, выход в интернет через Cloudflare WARP
   2) Цепочка — этот сервер входной (сайт + VLESS), трафик уходит на 1–3
                выходных релея (по IP, без доменов и сайтов); на них скрипт всё
-               ставит сам по SSH, между серверами — быстрый Shadowsocks-2022,
-               а релей для каждого соединения выбирается по загруженности
+               ставит сам по SSH, между серверами — обычный WireGuard в ядре
+               (ничего поверх), релей для каждого соединения выбирает Xray
 EOF
     read -r -p "Режим [$def]: " ans || true
     ans="${ans:-$def}"
@@ -192,6 +239,19 @@ ensure_domain(){
   valid_domain "$DOMAIN" || die "Укажите корректный DOMAIN (пример: DOMAIN=example.com bash install.sh). IP-адрес не подходит — нужен домен."
 }
 
+# SNI для Reality: по умолчанию тот же домен, по которому клиент подключается
+resolve_sni(){
+  SNI="${SNI,,}"
+  if [[ -z "$SNI" ]]; then SNI="$DOMAIN"; fi
+  valid_domain "$SNI" || die "Некорректный SNI=\"$SNI\" (нужно доменное имя, например example.com; пусто — взять DOMAIN)"
+  if [[ "$SNI" == "$DOMAIN" ]]; then
+    SERVER_NAMES="\"$DOMAIN\""
+  else
+    SERVER_NAMES="\"$SNI\", \"$DOMAIN\""
+    warn "SNI ($SNI) отличается от DOMAIN ($DOMAIN). Сертификат nginx выдан на DOMAIN, поэтому при проверке сервера с SNI=$SNI он не совпадёт. Убедитесь, что вам это нужно."
+  fi
+}
+
 # ================================================================ пакеты
 install_packages(){
   log "Установка пакетов"
@@ -199,13 +259,18 @@ install_packages(){
   case "$MODE" in
     warp)  pk=(curl ca-certificates openssl nginx certbot ufw iproute2 unzip qrencode) ;;
     chain)
-      pk=(curl ca-certificates openssl nginx certbot ufw iproute2 unzip qrencode haproxy socat openssh-client)
+      pk=(curl ca-certificates openssl nginx certbot ufw iproute2 unzip qrencode openssh-client iputils-ping)
       if [[ -n "$EXIT_SSH_PASS" ]]; then pk+=(sshpass); fi ;;
-    exit)  # на релее нет сайта: nginx и certbot не нужны
-      pk=(curl ca-certificates openssl ufw iproute2 unzip) ;;
+    exit)  # на релее нет ни сайта, ни Xray: только ядро + wg + NAT
+      pk=(ca-certificates ufw iproute2) ;;
   esac
   apt-get -o DPkg::Lock::Timeout=300 update -y
   apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold install -y "${pk[@]}" >/dev/null
+  # WireGuard — без рекомендованных пакетов (resolvconf и прочее серверу не нужны)
+  case "$MODE" in
+    chain) apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends wireguard-tools >/dev/null ;;
+    exit)  apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends wireguard-tools iptables >/dev/null ;;
+  esac
 }
 
 check_dns(){
@@ -269,18 +334,17 @@ EOF
     umask 022
   fi
 
-  # ключ канала вход -> релей (Shadowsocks-2022, общий для всех релеев)
+  # ключи WireGuard входного сервера (один ключ на все туннели к релеям)
   if [[ "$MODE" == chain ]]; then
-    local want klen
-    want="${SS_METHOD_ARG:-${SS_METHOD:-2022-blake3-aes-128-gcm}}"
-    klen=$(ss_keylen "$want") || die "Неизвестный SS_METHOD=\"$want\". Допустимо: 2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm, 2022-blake3-chacha20-poly1305"
-    SS_METHOD="$want"
-    if [[ -z "${X_SS_KEY:-}" ]] || (( $(printf '%s' "$X_SS_KEY" | base64 -d 2>/dev/null | wc -c) != klen )); then
-      log "Генерация ключа канала вход → релей (Shadowsocks-2022)"
-      X_SS_KEY=$(openssl rand -base64 "$klen")
-      save_kv X_SS_KEY "$X_SS_KEY"
+    # ключи прежнего канала Shadowsocks-2022 больше не нужны
+    if [[ -f "$ENVF" ]]; then sed -i '/^X_SS_KEY=/d;/^SS_METHOD=/d' "$ENVF"; fi
+    if [[ -z "${ENT_WG_PRIV:-}" || -z "${ENT_WG_PUB:-}" ]]; then
+      log "Генерация ключей WireGuard входного сервера"
+      ENT_WG_PRIV=$(wg genkey)
+      ENT_WG_PUB=$(printf '%s' "$ENT_WG_PRIV" | wg pubkey)
+      save_kv ENT_WG_PRIV "$ENT_WG_PRIV"
+      save_kv ENT_WG_PUB "$ENT_WG_PUB"
     fi
-    save_kv SS_METHOD "$SS_METHOD"
   fi
 }
 
@@ -540,7 +604,7 @@ emit_client_inbounds(){
           "show": false,
           "dest": "127.0.0.1:8443",
           "xver": 0,
-          "serverNames": ["$DOMAIN"],
+          "serverNames": [$SERVER_NAMES],
           "privateKey": "$R_PRIV",
           "shortIds": ["$SID"]
         }
@@ -630,100 +694,72 @@ $(emit_client_inbounds)
 EOF
 }
 
-# Канал вход -> релей: Shadowsocks-2022 — лёгкий AEAD-протокол без TLS-рукопожатий,
-# без Reality/Vision и без маскировки (между своими серверами она не нужна).
-# $1 — тег, $2 — адрес, $3 — порт
-ss_outbound_json(){
-  cat <<EOF
-{
-  "tag": "$1",
-  "protocol": "shadowsocks",
-  "settings": {
-    "servers": [{
-      "address": "$2",
-      "port": $3,
-      "method": "$SS_METHOD",
-      "password": "$X_SS_KEY"
-    }]
-  }
-}
-EOF
-}
-
-# TCP идёт через локальный HAProxy: он выбирает релей по нагрузке
-chain_outbound_json(){ ss_outbound_json chain 127.0.0.1 "$HA_PORT"; }
-
-# Домены клиентов на входе не резолвятся (AsIs): разрешает имена уже выходной релей.
-# UDP (QUIC, звонки, игры, DNS) HAProxy проксировать не умеет, поэтому он идёт нативным
-# UDP Shadowsocks-2022 напрямую на релеи: случайный релей на каждый UDP-поток.
+# Цепочка. На каждый релей — свой outbound exit-k (freedom), привязанный к адресу
+# туннеля wgxK (sendThrough); policy routing (ip rule from <адрес>) уводит его пакеты
+# прямо в WireGuard-интерфейс. Прямого выхода нет: других outbound'ов, кроме block, нет.
+# Имена клиентов резолвит сам Xray (DNS 1.1.1.1 идёт тоже через туннель, а не напрямую),
+# поэтому routing — IPIfNonMatch: домены, ведущие на частные адреса, блокируются.
+# Для 2–3 релеев — балансировщик: случайный выбор среди живых (burstObservatory
+# пробует каждый релей каждые 15 с, упавший исключается), при одном релее — прямое правило.
 write_xray_chain(){
   log "Конфигурация Xray (цепочка)"
-  local i udp_outs=""
+  local n=${#EX_IP[@]} i outs="" blocked target obs="" bal=""
   for i in "${!EX_IP[@]}"; do
-    udp_outs+="    $(ss_outbound_json "chain-udp-$((i+1))" "${EX_IP[$i]}" 443),"$'\n'
+    outs+="    {\"tag\": \"exit-$((i+1))\", \"protocol\": \"freedom\", \"sendThrough\": \"$(wg_entry_ip "$i")\", \"settings\": {\"domainStrategy\": \"UseIPv4\"}},"$'\n'
   done
-  cat > "$XCONF" <<EOF
-{
-  "log": {"loglevel": "warning", "access": "none"},
-  "inbounds": [
-$(emit_client_inbounds)
-  ],
-  "outbounds": [
-    $(chain_outbound_json),
-$udp_outs    {"tag": "block", "protocol": "blackhole"}
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
-      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
-      {"type": "field", "network": "udp", "balancerTag": "udp-relays"},
-      {"type": "field", "network": "tcp", "outboundTag": "chain"}
-    ],
-    "balancers": [
-      {"tag": "udp-relays", "selector": ["chain-udp-"], "strategy": {"type": "random"}}
-    ]
-  }
-}
+  # закрываем доступ клиентов к самим серверам цепочки (вход и релеи)
+  blocked=$(printf ', "%s"' "$ENTRY_IP" "${EX_IP[@]}")
+  if (( n > 1 )); then
+    target='"balancerTag": "exits"'
+    obs=$(cat <<EOF
+  "burstObservatory": {
+    "subjectSelector": ["exit-"],
+    "pingConfig": {
+      "destination": "https://1.1.1.1/cdn-cgi/trace",
+      "connectivity": "",
+      "interval": "15s",
+      "sampling": 3,
+      "timeout": "5s"
+    }
+  },
 EOF
-}
-
-write_xray_exit(){
-  log "Конфигурация Xray (выходной релей)"
-  # Сайта, сертификата и маскировки на релее нет: только Shadowsocks-2022 (TCP+UDP).
-  # Порт 443 фаервол открывает лишь для входного сервера.
+)
+    bal=$(cat <<EOF
+,
+    "balancers": [
+      {
+        "tag": "exits",
+        "selector": ["exit-"],
+        "strategy": {"type": "leastLoad", "settings": {"expected": $n, "maxRTT": "2s", "tolerance": 0.2}},
+        "fallbackTag": "exit-1"
+      }
+    ]
+EOF
+)
+  else
+    target='"outboundTag": "exit-1"'
+  fi
   cat > "$XCONF" <<EOF
 {
   "log": {"loglevel": "warning", "access": "none"},
   "dns": {
-    "servers": ["https+local://1.1.1.1/dns-query", "https+local://1.0.0.1/dns-query", "localhost"],
+    "servers": ["1.1.1.1", "1.0.0.1"],
     "queryStrategy": "UseIPv4"
   },
+$obs
   "inbounds": [
-    {
-      "tag": "chain-in",
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "shadowsocks",
-      "settings": {
-        "method": "$SS_METHOD",
-        "password": "$X_SS_KEY",
-        "network": "tcp,udp"
-      },
-      $SNIFF
-    }
+$(emit_client_inbounds)
   ],
   "outbounds": [
-    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
-    {"tag": "block", "protocol": "blackhole"}
+$outs    {"tag": "block", "protocol": "blackhole"}
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "ip": ["geoip:private"$blocked], "outboundTag": "block"},
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
-      {"type": "field", "network": "tcp,udp", "outboundTag": "direct"}
-    ]
+      {"type": "field", "network": "tcp,udp", $target}
+    ]$bal
   }
 }
 EOF
@@ -753,7 +789,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
-# $1 — IP входного сервера (только на выходном релее: ему открывается порт агента)
+# $1 — IP входного сервера (только на выходном релее: ему открывается порт WireGuard)
 setup_ufw(){
   if [[ -n "$NO_UFW" ]]; then return 0; fi
   local ports p
@@ -762,16 +798,15 @@ setup_ufw(){
             ss -tlnpH 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}'; } | sort -un || true)
   ports=${ports:-22}
   if [[ -n "${1:-}" ]]; then
-    log "Фаервол (ufw): открыт SSH; порты 443 (TCP+UDP) и агента $AGENT_PORT — только для ${1}"
+    log "Фаервол (ufw): открыт SSH; WireGuard (UDP $WG_PORT) — только для ${1}"
   else
     log "Фаервол (ufw): открыты SSH, 80, 443"
   fi
   for p in $ports; do ufw allow "$p"/tcp >/dev/null; done
   if [[ -n "${1:-}" ]]; then
-    # релей: сайта нет, канал вход -> релей и агент нагрузки видит только входной сервер
+    # релей: сайта нет, виден только WireGuard и только входному серверу
     ufw delete allow 443/tcp >/dev/null 2>&1 || true   # убрать открытый всем 443 от прежней версии
-    ufw allow from "$1" to any port 443 >/dev/null
-    ufw allow from "$1" to any port "$AGENT_PORT" proto tcp >/dev/null
+    ufw allow from "$1" to any port "$WG_PORT" proto udp >/dev/null
   else
     ufw allow 80/tcp >/dev/null
     ufw allow 443/tcp >/dev/null
@@ -779,108 +814,90 @@ setup_ufw(){
   ufw --force enable >/dev/null
 }
 
-# ================================================================ сетевые проверки
-tcp_ok(){ timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
-agent_read(){
-  timeout 7 bash -c 'exec 3<>"/dev/tcp/$1/$2"; IFS= read -r -t 5 l <&3; printf "%s" "$l"' _ "$1" "$2" 2>/dev/null || true
+# ================================================================ уборка после прежних версий
+# вход: прежний HAProxy (выбор релея по нагрузке) больше не нужен
+drop_haproxy_legacy(){
+  if [[ -f "$HA_CFG" ]] && grep -q '^# vpn-installer' "$HA_CFG"; then
+    log "Отключаю прежний HAProxy (в цепочке он больше не используется)"
+    systemctl disable --now haproxy >/dev/null 2>&1 || true
+    mv -f "$HA_CFG" "$HA_CFG.vpn-old"
+    if [[ -f "$HA_CFG.orig" ]]; then cp "$HA_CFG.orig" "$HA_CFG"; fi
+    rm -f /usr/local/bin/vpn-status "$EXITS_MAP"
+  fi
 }
 
-# ================================================================ выходной релей: агент нагрузки
-setup_agent(){
-  log "Агент нагрузки (порт $AGENT_PORT, отвечает только входному серверу)"
-  [[ "$NET_CAP_MBIT" =~ ^[0-9]+$ ]] || NET_CAP_MBIT=1000
-
-  cat > /usr/local/sbin/vpn-load-agent <<'AGENT'
-#!/usr/bin/env bash
-# Агент нагрузки для HAProxy (agent-check).
-# Печатает вес сервера в процентах: 100% — свободен, 1% — загружен полностью.
-# Загрузка = максимум из: CPU, load average на ядро, сеть (к полосе канала), RAM (если >85%).
-set -u
-CONF=/etc/vpn-load-agent.conf
-NET_CAP_MBIT=1000
-if [[ -r "$CONF" ]]; then . "$CONF"; fi
-
-IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
-
-snap(){   # "total idle rx tx uptime"
-  local _ u n s i w q sq st rx tx up
-  read -r _ u n s i w q sq st _ < /proc/stat
-  read -r rx tx < <(sed 's/:/ /' /proc/net/dev | awk -v f="$IFACE" '$1==f{print $2,$10}')
-  read -r up _ < /proc/uptime
-  echo "$((u+n+s+i+w+q+sq+st)) $((i+w)) ${rx:-0} ${tx:-0} $up"
+# вход: убрать туннели wgx* (перед настройкой заново и при переходе на warp)
+drop_wg_chain() {
+  local f ifn
+  shopt -s nullglob
+  for f in "$WG_DIR"/wgx*.conf; do
+    ifn=$(basename "$f" .conf)
+    systemctl disable --now "wg-quick@$ifn" >/dev/null 2>&1 || true
+    rm -f "$f"
+  done
+  shopt -u nullglob
+  rm -f /usr/local/bin/vpn-status "$EXITS_MAP"
 }
 
-read -r t1 i1 rx1 tx1 up1 < <(snap)
-sleep 0.5
-read -r t2 i2 rx2 tx2 up2 < <(snap)
-cores=$(nproc 2>/dev/null || echo 1)
-read -r load1 _ < /proc/loadavg
-read -r memt mema < <(awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} END{print t+0, a+0}' /proc/meminfo)
+# релей: убрать Xray / Shadowsocks и агент нагрузки от прежней версии
+legacy_exit_cleanup(){
+  local old_port old_entry
+  old_port=$(env_get "$EXIT_ENVF" AGENT_PORT)
+  old_entry=$(env_get "$EXIT_ENVF" ENTRY_IP)
+  if [[ -f "$XCONF" ]] && grep -q '"chain-in"' "$XCONF" 2>/dev/null; then
+    log "Убираю прежний транспорт (Xray / Shadowsocks): теперь только WireGuard"
+    systemctl disable --now xray >/dev/null 2>&1 || true
+    mv -f "$XCONF" "$XCONF.vpn-old"
+  fi
+  if [[ -f /etc/systemd/system/vpn-load-agent.socket ]]; then
+    systemctl disable --now vpn-load-agent.socket >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/vpn-load-agent.socket /etc/systemd/system/vpn-load-agent@.service \
+          /usr/local/sbin/vpn-load-agent /etc/vpn-load-agent.conf
+    systemctl daemon-reload
+  fi
+  if [[ -n "$old_entry" ]] && command -v ufw >/dev/null; then
+    ufw delete allow from "$old_entry" to any port 443 >/dev/null 2>&1 || true
+    if [[ -n "$old_port" ]]; then
+      ufw delete allow from "$old_entry" to any port "$old_port" proto tcp >/dev/null 2>&1 || true
+    fi
+  fi
+}
 
-awk -v t1="$t1" -v i1="$i1" -v t2="$t2" -v i2="$i2" \
-    -v rx1="$rx1" -v tx1="$tx1" -v rx2="$rx2" -v tx2="$tx2" \
-    -v u1="$up1" -v u2="$up2" -v cores="$cores" -v load="$load1" \
-    -v cap="$NET_CAP_MBIT" -v memt="$memt" -v mema="$mema" 'BEGIN{
-  dt = t2 - t1
-  cpu = (dt > 0) ? (dt - (i2 - i1)) * 100 / dt : 0
-  ld  = (cores > 0) ? load / cores * 100 : 0
-  el  = u2 - u1; if (el <= 0) el = 0.5
-  r = (rx2 - rx1) * 8 / el / 1e6
-  t = (tx2 - tx1) * 8 / el / 1e6
-  m = (r > t) ? r : t
-  net = (cap > 0) ? m * 100 / cap : 0
-  mem = (memt > 0 && mema > 0) ? (memt - mema) * 100 / memt : 0
-  if (mem < 85) mem = 0
-  s = cpu
-  if (ld  > s) s = ld
-  if (net > s) s = net
-  if (mem > s) s = mem
-  if (s > 100) s = 100
-  if (s < 0)   s = 0
-  w = 100 - s
-  if (w < 1) w = 1
-  printf "%d%%\n", w
-}'
-AGENT
-  chmod 755 /usr/local/sbin/vpn-load-agent
-  printf 'NET_CAP_MBIT=%s\n' "$NET_CAP_MBIT" > /etc/vpn-load-agent.conf
+# ================================================================ выходной релей: WireGuard + NAT
+setup_wg_exit(){
+  local ifn=wgin priv pub
+  log "WireGuard на релее: $TUN_EXIT_IP, UDP $WG_PORT (ядро Linux, ничего поверх)"
+  mkdir -p "$WG_DIR"; chmod 700 "$WG_DIR"
+  umask 077
+  if [[ ! -s "$WG_DIR/$ifn.key" ]]; then wg genkey > "$WG_DIR/$ifn.key"; fi
+  priv=$(<"$WG_DIR/$ifn.key")
+  pub=$(wg pubkey < "$WG_DIR/$ifn.key")
+  printf '%s\n' "$pub" > "$EXIT_PUB"
+  cat > "$WG_DIR/$ifn.conf" <<EOF
+# vpn-installer: файл создан install.sh
+[Interface]
+PrivateKey = $priv
+Address = $TUN_EXIT_IP/32
+ListenPort = $WG_PORT
+PostUp = sysctl -q -w net.ipv4.ip_forward=1
+PostUp = iptables -t nat -C POSTROUTING -s $TUN_ENTRY_IP/32 ! -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $TUN_ENTRY_IP/32 ! -o %i -j MASQUERADE
+PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -j ACCEPT
+PostUp = iptables -C FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s $TUN_ENTRY_IP/32 ! -o %i -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
-  cat > /etc/systemd/system/vpn-load-agent.socket <<EOF
-[Unit]
-Description=VPN load agent (socket)
-
-[Socket]
-ListenStream=$AGENT_PORT
-Accept=yes
-MaxConnections=16
-
-[Install]
-WantedBy=sockets.target
+[Peer]
+PublicKey = $ENT_WG_PUB
+AllowedIPs = $TUN_ENTRY_IP/32
 EOF
-  cat > /etc/systemd/system/vpn-load-agent@.service <<'EOF'
-[Unit]
-Description=VPN load agent
-
-[Service]
-ExecStart=/usr/local/sbin/vpn-load-agent
-StandardInput=socket
-StandardOutput=socket
-StandardError=journal
-User=nobody
-RuntimeMaxSec=10
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-EOF
-  systemctl daemon-reload
-  systemctl enable vpn-load-agent.socket >/dev/null 2>&1
-  systemctl restart vpn-load-agent.socket
-
-  local r
-  r=$(agent_read 127.0.0.1 "$AGENT_PORT")
-  [[ "$r" =~ ^[0-9]+%$ ]] || die "Агент нагрузки не отвечает на порту $AGENT_PORT"
-  echo "Агент нагрузки работает, текущий вес: $r"
+  umask 022
+  printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/98-vpn-forward.conf
+  sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  systemctl enable "wg-quick@$ifn" >/dev/null 2>&1
+  systemctl restart "wg-quick@$ifn" || { journalctl -u "wg-quick@$ifn" -n 20 --no-pager || true; die "Не поднялся WireGuard на релее"; }
+  wg show "$ifn" >/dev/null || die "Интерфейс $ifn не создан"
+  echo "WireGuard на релее поднят"
 }
 
 # ================================================================ входной сервер: цепочка
@@ -914,7 +931,7 @@ collect_exits(){
   (( ${#specs[@]} >= 1 )) || die "Не указаны выходные релеи (пример: EXITS=\"203.0.113.10 203.0.113.11\")"
   (( ${#specs[@]} <= 3 )) || die "Выходных релеев может быть от 1 до 3 (указано ${#specs[@]})"
 
-  EX_USER=(); EX_HOST=(); EX_PORT=(); EX_IP=()
+  EX_USER=(); EX_HOST=(); EX_PORT=(); EX_IP=(); EX_PUB=()
   for s in "${specs[@]}"; do
     user=root; port=22
     if [[ "$s" == *@* ]]; then user="${s%%@*}"; s="${s#*@}"; fi
@@ -989,19 +1006,22 @@ ssh-keygen -f $CHAIN_KNOWN -R $h"
   echo "SSH-доступ к $h есть"
 }
 
-# параметры, которые входной сервер передаёт релею (файл с правами 600, не командная строка)
+# параметры, которые входной сервер передаёт релею (файл с правами 600, не командная строка);
+# приватный ключ релея никуда не передаётся: релей создаёт его у себя и отдаёт только публичный
 make_params(){
   local i="$1" v
-  for v in EMAIL FORCE NO_UFW AGENT_PORT NET_CAP_MBIT X_SS_KEY SS_METHOD ENTRY_IP; do
+  for v in NO_UFW WG_PORT ENT_WG_PUB ENTRY_IP; do
     printf '%s=%q\n' "$v" "${!v}"
   done
+  printf 'TUN_ENTRY_IP=%q\n' "$(wg_entry_ip "$i")"
+  printf 'TUN_EXIT_IP=%q\n' "$(wg_exit_ip "$i")"
 }
 
 deploy_exit(){
-  local i="$1" h tmp pre="" rc=0
+  local i="$1" h tmp pre="" rc=0 pub
   h="${EX_HOST[$i]}"
   if [[ "${EX_USER[$i]}" != root ]]; then pre="sudo -n"; fi
-  log "Установка выходного релея $h (${EX_IP[$i]}) — это займёт пару минут"
+  log "Установка выходного релея $h (${EX_IP[$i]}) — это займёт минуту"
   tmp=$(mktemp); chmod 600 "$tmp"
   make_params "$i" > "$tmp"
   xscp "$i" "$SELF" ".vpn-install.sh"
@@ -1012,133 +1032,92 @@ deploy_exit(){
     | sed -u "s/^/[$h] /" || rc=$?
   xssh "$i" 'rm -f "$HOME/.vpn-exit-params.env" "$HOME/.vpn-install.sh"' || true
   (( rc == 0 )) || die "Не удалось настроить выходной релей $h (причина — в выводе выше). Исправьте её и запустите скрипт снова: он идемпотентен."
+  pub=$(xssh "$i" "$pre cat $EXIT_PUB" 2>/dev/null | tr -d '[:space:]' || true)
+  [[ "$pub" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "Не удалось получить публичный ключ WireGuard релея $h"
+  EX_PUB[i]="$pub"
 }
 
-verify_exits(){
-  local i ip ok r t
-  log "Проверка выходных релеев"
-  for i in "${!EX_HOST[@]}"; do
-    ip="${EX_IP[$i]}"; ok=0
-    for t in 1 2 3 4 5; do
-      if tcp_ok "$ip" 443; then ok=1; break; fi
-      sleep 3
-    done
-    (( ok == 1 )) || die "${EX_HOST[$i]}: порт 443 недоступен с входного сервера"
-    r=$(agent_read "$ip" "$AGENT_PORT")
-    [[ "$r" =~ ^[0-9]+%$ ]] || die "${EX_HOST[$i]}: агент нагрузки ($ip:$AGENT_PORT) не отвечает. Проверьте, что релей видит входной сервер как $ENTRY_IP (иначе задайте ENTRY_IP=…) и что хостер не режет порт."
-    echo "${EX_HOST[$i]}  ($ip):  443 — ок,  свободно ресурсов: $r"
-  done
-}
-
-write_haproxy(){
-  log "HAProxy: выбор релея по нагрузке"
-  if [[ -f "$HA_CFG" ]] && ! grep -q '^# vpn-installer' "$HA_CFG" && [[ ! -f "$HA_CFG.orig" ]]; then
-    cp "$HA_CFG" "$HA_CFG.orig"
-  fi
-  local i
-  {
-    cat <<EOF
-# vpn-installer: файл создан install.sh, ручные правки будут перезаписаны
-global
-    maxconn 20000
-    user haproxy
-    group haproxy
-    stats socket $HA_SOCK mode 660 level admin
-
-defaults
-    mode tcp
-    option dontlognull
-    option redispatch
-    retries 2
-    timeout connect 5s
-    timeout client 2h
-    timeout server 2h
-    timeout tunnel 2h
-    timeout check 3s
-
-# Новые соединения идут на релей с наименьшим числом соединений относительно
-# его веса; вес каждые 5 с обновляет агент релея (свободные CPU/сеть/RAM).
-listen vpn_exits
-    bind 127.0.0.1:$HA_PORT
-    balance leastconn
-    default-server inter 10s fastinter 3s downinter 5s rise 2 fall 3
-EOF
-    for i in "${!EX_HOST[@]}"; do
-      echo "    server exit$((i+1)) ${EX_IP[$i]}:443 check agent-check agent-port $AGENT_PORT agent-inter 5s weight 100"
-    done
-  } > "$HA_CFG"
+# входные туннели: по интерфейсу wgxK на релей (ядро, Table = off — маршрутами управляем сами)
+setup_wg_entry(){
+  log "WireGuard: туннели вход → релеи (ядро Linux, ничего поверх)"
+  local i ifn eip rip tbl prio
+  mkdir -p "$WG_DIR"; chmod 700 "$WG_DIR"
+  drop_wg_chain
   : > "$EXITS_MAP"
-  for i in "${!EX_HOST[@]}"; do echo "exit$((i+1)),${EX_HOST[$i]}" >> "$EXITS_MAP"; done
+  for i in "${!EX_IP[@]}"; do
+    ifn=$(wg_if "$i"); eip=$(wg_entry_ip "$i"); rip=$(wg_exit_ip "$i")
+    tbl=$(wg_table "$i"); prio=$((1001 + i))
+    umask 077
+    cat > "$WG_DIR/$ifn.conf" <<EOF
+# vpn-installer: файл создан install.sh
+[Interface]
+PrivateKey = $ENT_WG_PRIV
+Address = $eip/32
+Table = off
+# всё, что исходит с адреса этого туннеля, уходит в него (и больше никуда)
+PostUp = ip -4 route replace default dev %i table $tbl
+PostUp = ip -4 rule del from $eip/32 lookup $tbl 2>/dev/null; ip -4 rule add from $eip/32 lookup $tbl priority $prio
+PostDown = ip -4 rule del from $eip/32 lookup $tbl 2>/dev/null; ip -4 route flush table $tbl 2>/dev/null; true
 
-  haproxy -c -f "$HA_CFG" >/dev/null || { haproxy -c -f "$HA_CFG" || true; die "Конфиг HAProxy не прошёл проверку"; }
-  systemctl enable haproxy >/dev/null 2>&1
-  systemctl restart haproxy
-  sleep 2
-  systemctl is-active --quiet haproxy || { journalctl -u haproxy -n 30 --no-pager; die "HAProxy не запустился"; }
+[Peer]
+PublicKey = ${EX_PUB[$i]}
+Endpoint = ${EX_IP[$i]}:$WG_PORT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+    umask 022
+    echo "$ifn,${EX_HOST[$i]},$eip,$rip" >> "$EXITS_MAP"
+    systemctl enable "wg-quick@$ifn" >/dev/null 2>&1
+    systemctl restart "wg-quick@$ifn" || { journalctl -u "wg-quick@$ifn" -n 20 --no-pager || true; die "Не поднялся туннель $ifn"; }
+  done
+  write_vpn_status
+}
 
+write_vpn_status(){
   cat > /usr/local/bin/vpn-status <<'EOF'
 #!/usr/bin/env bash
-# Состояние выходных релеев: статус, вес (по нагрузке), текущие и всего соединений.
-SOCK=/run/haproxy-vpn.sock
+# Состояние туннелей вход -> релеи (WireGuard): рукопожатие, трафик, задержка до релея.
 MAP=/etc/vpn-exits.map
-[[ -S "$SOCK" ]] || { echo "HAProxy не запущен"; exit 1; }
-printf '%-7s %-30s %-14s %-7s %-7s %s\n' RELAY DOMAIN STATUS WEIGHT CONNS TOTAL
-echo "show stat" | socat stdio "unix-connect:$SOCK" \
-  | awk -F, 'NR==FNR{d[$1]=$2; next}
-             $1=="vpn_exits" && $2!="FRONTEND" && $2!="BACKEND" {
-               printf "%-7s %-30s %-14s %-7s %-7s %s\n", $2, d[$2], $18, $19, $5, $8 }' "$MAP" -
+[[ -r "$MAP" ]] || { echo "Нет $MAP: это не входной сервер цепочки"; exit 1; }
+now=$(date +%s)
+printf '%-6s %-17s %-12s %-9s %-9s %s\n' IFACE RELAY HANDSHAKE RX TX RTT
+while IFS=, read -r ifn host eip rip; do
+  [[ -n "$ifn" ]] || continue
+  hs=$(wg show "$ifn" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+  if [[ "${hs:-0}" -gt 0 ]]; then age="$((now - hs)) c назад"; else age="нет"; fi
+  read -r rx tx < <(wg show "$ifn" transfer 2>/dev/null | awk 'NR==1{print $2, $3}')
+  rtt=$(ping -c3 -W2 -I "$eip" "$rip" 2>/dev/null | awk -F/ '/^(rtt|round-trip)/{print $5" ms"}')
+  printf '%-6s %-17s %-12s %-9s %-9s %s\n' "$ifn" "$host" "$age" \
+    "$(numfmt --to=iec "${rx:-0}" 2>/dev/null || echo "${rx:-0}")" \
+    "$(numfmt --to=iec "${tx:-0}" 2>/dev/null || echo "${tx:-0}")" "${rtt:-недоступен}"
+done < "$MAP"
 EOF
   chmod 755 /usr/local/bin/vpn-status
 }
 
-test_chain(){
-  log "Проверка цепочки вход → релей → интернет"
-  local tpid ip="" i
-  cat > /tmp/xray-chain-test.json <<EOF
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"udp": false}}],
-  "outbounds": [$(chain_outbound_json)]
-}
-EOF
-  xray run -config /tmp/xray-chain-test.json >/tmp/xray-chain-test.log 2>&1 &
-  tpid=$!
-  sleep 3
-  for i in 1 2 3 4; do
-    ip=$(curl -4fsS --max-time 20 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null || true)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then break; fi
-    ip=""; sleep 3
+# проверка без Xray: curl с адреса туннеля должен выйти в интернет с IP релея
+verify_tunnels(){
+  log "Проверка туннелей вход → релей → интернет"
+  local i ifn eip ip t
+  for i in "${!EX_IP[@]}"; do
+    ifn=$(wg_if "$i"); eip=$(wg_entry_ip "$i"); ip=""
+    for t in 1 2 3 4 5; do
+      ip=$(curl -4fsS --max-time 8 --interface "$eip" https://api.ipify.org 2>/dev/null || true)
+      if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then break; fi
+      ip=""; sleep 2
+    done
+    if [[ -z "$ip" ]]; then
+      echo "--- wg show $ifn ---"; wg show "$ifn" || true
+      die "${EX_HOST[$i]}: трафик не проходит через WireGuard-туннель $ifn. Проверьте, что UDP $WG_PORT доходит до релея (хостер/фаервол/DPI), что релей видит входной сервер как $ENTRY_IP (иначе задайте ENTRY_IP=…) и нет ли пересечения сети $WG_NET.x.x с сетью хостера (WG_NET=…)."
+    fi
+    echo "${EX_HOST[$i]}: туннель $ifn работает, выход в интернет с IP $ip"
   done
-  kill "$tpid" 2>/dev/null || true
-  wait "$tpid" 2>/dev/null || true
-  rm -f /tmp/xray-chain-test.json
-  if [[ -z "$ip" ]]; then
-    echo "--- лог Xray ---"; tail -n 20 /tmp/xray-chain-test.log || true
-    echo "--- HAProxy ---"; /usr/local/bin/vpn-status || true
-    die "Трафик не проходит через выходные релеи. Проверьте вывод выше."
-  fi
-  rm -f /tmp/xray-chain-test.log
-  local j found=0
-  for j in "${EX_IP[@]}"; do if [[ "$j" == "$ip" ]]; then found=1; fi; done
-  if (( found == 1 )); then
-    echo "Цепочка работает: выход в интернет через релей с IP $ip"
-  else
-    echo "Цепочка работает. Внешний IP для сайтов: $ip (отличается от IP релея — у хостера, видимо, отдельный исходящий адрес)"
-  fi
-}
-
-disable_chain_leftovers(){
-  if [[ -f "$HA_CFG" ]] && grep -q '^# vpn-installer' "$HA_CFG"; then
-    log "Отключаю HAProxy от прежнего режима chain"
-    systemctl disable --now haproxy >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/vpn-status "$EXITS_MAP"
-  fi
 }
 
 # ================================================================ итог для входного сервера
 print_links(){
   local L_REALITY L_XHTTP L_GRPC L_WS L_HU
-  L_REALITY="vless://$UUID@$DOMAIN:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$DOMAIN&fp=chrome&pbk=$R_PUB&sid=$SID&type=tcp&headerType=none#hlebcraft-reality"
+  L_REALITY="vless://$UUID@$DOMAIN:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$R_PUB&sid=$SID&type=tcp&headerType=none#hlebcraft-reality"
   L_XHTTP="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&fp=chrome&alpn=h2&type=xhttp&host=$DOMAIN&path=%2F$P_XHTTP&mode=auto#hlebcraft-xhttp"
   L_GRPC="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&fp=chrome&alpn=h2&type=grpc&serviceName=$P_GRPC&mode=gun#hlebcraft-grpc"
   L_WS="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&fp=chrome&alpn=http%2F1.1&type=ws&host=$DOMAIN&path=%2F$P_WS#hlebcraft-ws"
@@ -1160,11 +1139,12 @@ EOF
   printf '\n\033[1;32m================ ГОТОВО ================\033[0m\n'
   echo "Режим:  $MODE"
   echo "Сайт:   https://$DOMAIN"
+  echo "SNI (Reality):  $SNI"
   if [[ "$MODE" == chain ]]; then
-    echo "Выходные релеи:"
+    echo "Выходные релеи (WireGuard):"
     local i
-    for i in "${!EX_HOST[@]}"; do echo "  exit$((i+1))  ${EX_HOST[$i]}  (${EX_IP[$i]})"; done
-    echo "Нагрузка и состояние релеев:  vpn-status"
+    for i in "${!EX_HOST[@]}"; do echo "  $(wg_if "$i")  ${EX_HOST[$i]}  (${EX_IP[$i]})"; done
+    echo "Состояние туннелей:  vpn-status"
   fi
   echo "Ссылки сохранены: /root/vless-links.txt"
   echo
@@ -1179,8 +1159,10 @@ EOF
 # ================================================================ сценарии
 run_warp(){
   ensure_domain "этого сервера"
+  resolve_sni
   log "Режим: WARP (один сервер)"
-  disable_chain_leftovers
+  drop_haproxy_legacy
+  drop_wg_chain
   install_packages
   check_dns
   install_xray
@@ -1198,10 +1180,13 @@ run_warp(){
 
 run_chain(){
   ensure_domain "ВХОДНОГО сервера"
+  resolve_sni
+  check_wg_settings
   collect_exits
   [[ -f "$SELF" && -r "$SELF" ]] || die "Запускайте скрипт из файла (bash install.sh), а не через pipe: он копирует себя на выходные релеи."
-  log "Режим: цепочка. Вход: $DOMAIN  →  релеи: ${EX_HOST[*]}"
+  log "Режим: цепочка. Вход: $DOMAIN  →  релеи: ${EX_HOST[*]}  (WireGuard)"
   install_packages
+  check_wireguard
   check_dns
   ENTRY_IP="${ENTRY_IP:-$SERVER_IP}"
   [[ "$ENTRY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Не удалось определить внешний IP входного сервера — задайте ENTRY_IP=…"
@@ -1210,17 +1195,17 @@ run_chain(){
     [[ "$i" != "$ENTRY_IP" ]] || die "Выходной релей $i совпадает с входным сервером"
   done
   install_xray
-  load_secrets      # заодно ключ и шифр канала вход -> релей (Shadowsocks-2022)
+  load_secrets      # заодно ключи WireGuard входного сервера
 
   init_ssh
   for i in "${!EX_HOST[@]}"; do ensure_ssh_access "$i"; done
   for i in "${!EX_HOST[@]}"; do deploy_exit "$i"; done
-  verify_exits
 
   setup_site
   write_nginx_tls 1
-  write_haproxy
-  test_chain
+  drop_haproxy_legacy
+  setup_wg_entry
+  verify_tunnels
   write_xray_chain
   finish_xray
   setup_bbr
@@ -1236,24 +1221,23 @@ run_exit(){
   . "$PARAMS_FILE"
   rm -f "$PARAMS_FILE"
   local v
-  for v in X_SS_KEY SS_METHOD ENTRY_IP; do
+  for v in ENT_WG_PUB ENTRY_IP TUN_ENTRY_IP TUN_EXIT_IP WG_PORT; do
     [[ -n "${!v:-}" ]] || die "В параметрах выходного релея нет $v"
   done
-  ss_keylen "$SS_METHOD" >/dev/null || die "Неизвестный шифр канала: $SS_METHOD"
+  check_wg_settings
+  legacy_exit_cleanup       # до перезаписи EXIT_ENVF: оттуда берутся старые порты
   umask 077
-  for v in X_SS_KEY SS_METHOD ENTRY_IP AGENT_PORT NET_CAP_MBIT; do
+  for v in ENT_WG_PUB ENTRY_IP TUN_ENTRY_IP TUN_EXIT_IP WG_PORT; do
     printf '%s=%q\n' "$v" "${!v}"
   done > "$EXIT_ENVF"
   umask 022
 
-  log "Режим: ВЫХОДНОЙ релей (без сайта и домена), вход: $ENTRY_IP, канал: Shadowsocks-2022"
+  log "Режим: ВЫХОДНОЙ релей (без сайта и домена), вход: $ENTRY_IP, канал: WireGuard"
   install_packages
-  install_xray
-  write_xray_exit
-  finish_xray
-  setup_agent
-  setup_bbr
+  check_wireguard
   setup_ufw "$ENTRY_IP"
+  setup_wg_exit
+  setup_bbr
   printf '\n\033[1;32m=== Выходной релей готов ===\033[0m\n'
 }
 
