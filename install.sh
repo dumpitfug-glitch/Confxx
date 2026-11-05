@@ -77,11 +77,22 @@ WG_MTU="${WG_MTU:-1380}"
 #
 #  Запуск (скрипт должен лежать файлом — он сам копирует себя на выходные релеи):
 #
+#    # 1) скачать ИМЕННО «сырой» файл (raw), а не страницу сайта, и проверить первую строку:
+#    curl -fsSL -o install.sh <ПРЯМАЯ_ССЫЛКА_НА_ФАЙЛ>
+#    head -n1 install.sh        # ждём: #!/usr/bin/env bash
+#                               # увидели <!DOCTYPE html> — ссылка ведёт на веб-страницу, не на файл
+#    # (для GitHub это raw.githubusercontent.com/..., а не github.com/.../blob/...)
+#
+#    # 2) запустить (домен — только латиницей/цифрами; для кириллических доменов нужен punycode xn--…)
 #    bash install.sh                                   # интерактивное меню
-#    DOMAIN=вход.example.com bash install.sh           # режим warp
-#    DOMAIN=вход.example.com MODE=chain \
+#    DOMAIN=entry.example.com bash install.sh          # режим warp
+#    DOMAIN=entry.example.com MODE=chain \
 #      EXITS="203.0.113.10 203.0.113.11:2222 ubuntu@203.0.113.12" \
 #      bash install.sh                                 # режим chain
+#
+#    Режим warp можно запустить и одной командой через pipe (переменные — перед bash, не перед curl):
+#      curl -fsSL <ПРЯМАЯ_ССЫЛКА> | DOMAIN=entry.example.com bash
+#    Режим chain и интерактивное меню через pipe не работают — только из файла.
 #
 #  Переменные (необязательные; SNI, WG_PORT, WG_NET и WG_MTU — см. НАСТРОЙКИ выше):
 #    EMAIL=…           e-mail для Let's Encrypt (входной сервер)
@@ -245,13 +256,13 @@ ensure_domain(){
       read -r -p "Домен ${1:-этого сервера} (A-запись должна указывать на этот сервер): " DOMAIN || true
     fi
   fi
-  DOMAIN="${DOMAIN,,}"
+  DOMAIN="${DOMAIN//[[:space:]]/}"; DOMAIN="${DOMAIN,,}"
   valid_domain "$DOMAIN" || die "Укажите корректный DOMAIN (пример: DOMAIN=example.com bash install.sh). IP-адрес не подходит — нужен домен."
 }
 
 # SNI для Reality: по умолчанию тот же домен, по которому клиент подключается
 resolve_sni(){
-  SNI="${SNI,,}"
+  SNI="${SNI//[[:space:]]/}"; SNI="${SNI,,}"
   if [[ -z "$SNI" ]]; then SNI="$DOMAIN"; fi
   valid_domain "$SNI" || die "Некорректный SNI=\"$SNI\" (нужно доменное имя, например example.com; пусто — взять DOMAIN)"
   if [[ "$SNI" == "$DOMAIN" ]]; then
@@ -285,11 +296,22 @@ install_packages(){
 
 check_dns(){
   log "Проверка DNS для $DOMAIN"
+  local dns_all
   SERVER_IP=$(curl -4fsS --max-time 10 https://api.ipify.org || curl -4fsS --max-time 10 https://ifconfig.me || true)
-  DNS_IP=$(getent ahostsv4 "$DOMAIN" | awk 'NR==1{print $1}' || true)
+  # все A-записи домена (а не только первая): при нескольких записях порядок не гарантирован
+  dns_all=$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u || true)
+  DNS_IP=$(tr '\n' ' ' <<<"$dns_all"); DNS_IP="${DNS_IP% }"
   echo "IP сервера: ${SERVER_IP:-?}   A-запись $DOMAIN: ${DNS_IP:-нет}"
-  if [[ -z "$FORCE" && "$SERVER_IP" != "$DNS_IP" ]]; then
-    die "A-запись $DOMAIN должна указывать на $SERVER_IP (без проксирования Cloudflare / оранжевого облака). Исправьте DNS, подождите пару минут и запустите снова."
+  if [[ -z "$FORCE" ]]; then
+    [[ -n "$dns_all" ]] \
+      || die "У домена $DOMAIN нет A-записи. Создайте её на IP этого сервера (без проксирования Cloudflare), подождите пару минут и запустите снова."
+    [[ -n "$SERVER_IP" ]] \
+      || die "Не удалось определить внешний IP сервера (api.ipify.org и ifconfig.me недоступны). Проверьте сеть либо запустите с FORCE=1, если уверены в A-записи."
+    grep -qxF "$SERVER_IP" <<<"$dns_all" \
+      || die "A-запись $DOMAIN ($DNS_IP) должна указывать на $SERVER_IP (без проксирования Cloudflare / оранжевого облака). Исправьте DNS, подождите пару минут и запустите снова."
+    if [[ "$dns_all" == *$'\n'* ]]; then
+      warn "У $DOMAIN несколько A-записей ($DNS_IP). Let's Encrypt может зайти на любую из них — оставьте только IP этого сервера."
+    fi
   fi
 }
 
@@ -456,6 +478,13 @@ EOF
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl restart nginx
 
+  # Let's Encrypt проверяет домен по HTTP (порт 80). Если ufw на сервере уже включён
+  # (часть образов VPS) и 80 в нём закрыт, certbot упадёт — открываем заранее.
+  if [[ -z "$NO_UFW" ]] && command -v ufw >/dev/null 2>&1 \
+     && [[ "$(ufw status 2>/dev/null || true)" == *"Status: active"* ]]; then
+    ufw allow 80/tcp >/dev/null
+  fi
+
   if [[ ! -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
     local CB_MAIL
     if [[ -n "$EMAIL" ]]; then CB_MAIL=(-m "$EMAIL"); else CB_MAIL=(--register-unsafely-without-email); fi
@@ -591,8 +620,9 @@ setup_warp(){
   wgcf generate
   [[ -f wgcf-profile.conf ]] || die "Не создан профиль WARP"
 
-  WG_PRIV=$(awk -F' *= *' '/^PrivateKey/{print $2}' wgcf-profile.conf | tr -d ' \r')
-  WG_PUB=$(awk -F' *= *' '/^PublicKey/{print $2}' wgcf-profile.conf | tr -d ' \r')
+  # значение — всё после ПЕРВОГО "=": ключи base64 сами заканчиваются на "=", делить по "=" нельзя
+  WG_PRIV=$(awk '/^PrivateKey/{sub(/^[^=]*=[ \t]*/, ""); print; exit}' wgcf-profile.conf | tr -d ' \r')
+  WG_PUB=$(awk '/^PublicKey/{sub(/^[^=]*=[ \t]*/, ""); print; exit}' wgcf-profile.conf | tr -d ' \r')
   ADDR_JSON=$(grep -E '^Address' wgcf-profile.conf | sed 's/^Address *= *//' | tr ',' '\n' \
               | tr -d ' \r' | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd, -)
   [[ -n "$WG_PRIV" && -n "$WG_PUB" && -n "$ADDR_JSON" ]] || die "Не удалось разобрать профиль WARP"
@@ -857,12 +887,15 @@ finish_xray(){
   chown "root:$(id -gn "$XUSER" 2>/dev/null || echo nogroup)" "$XCONF"
   chmod 640 "$XCONF"
 
-  xray run -test -config "$XCONF" >/dev/null || die "Конфиг Xray не прошёл проверку"
+  local test_out
+  test_out=$(xray run -test -config "$XCONF" 2>&1) \
+    || { printf '%s\n' "$test_out"; die "Конфиг Xray не прошёл проверку (причина — в выводе выше)"; }
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
   sleep 2
   systemctl is-active --quiet xray || { journalctl -u xray -n 30 --no-pager; die "Xray не запустился"; }
-  ss -tln | grep -q ':443 ' || die "Порт 443 не слушается"
+  # без "ss | grep -q": при pipefail ранний выход grep может дать SIGPIPE и ложную ошибку
+  [[ "$(ss -tln)" == *":443 "* ]] || die "Порт 443 не слушается"
 }
 
 # Сквозная проверка Reality + Vision: локальный клиент Xray подключается к своему же
@@ -1329,11 +1362,11 @@ run_warp(){
 }
 
 run_chain(){
+  [[ -f "$SELF" && -r "$SELF" ]] || die "Режим chain нужно запускать из файла (bash install.sh), а не через pipe: скрипт копирует себя на выходные релеи. Скачайте файл: curl -fsSL -o install.sh <ссылка>"
   ensure_domain "ВХОДНОГО сервера"
   resolve_sni
   check_wg_settings
   collect_exits
-  [[ -f "$SELF" && -r "$SELF" ]] || die "Запускайте скрипт из файла (bash install.sh), а не через pipe: он копирует себя на выходные релеи."
   log "Режим: цепочка. Вход: $DOMAIN  →  релеи: ${EX_HOST[*]}  (WireGuard)"
   install_packages
   check_wireguard
